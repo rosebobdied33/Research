@@ -1,0 +1,713 @@
+const state = {
+  campaign: "baixi-garden",
+  page: "portfolio",
+  campaigns: [],
+  campaignData: {},
+  portfolio: null,
+  dashboard: null,
+  responses: [],
+  insights: null,
+  reports: [],
+  refreshReports: [],
+  onepagePdfs: [],
+  loading: false,
+  search: "",
+  expanded: null,
+  activeIssue: null,
+  answerFocus: null,
+  source: "all",
+  portfolioBySource: {},
+  sourceCounts: { online: 0, offline: 0 },
+};
+
+const STATIC_MODE = Boolean(window.STATIC_DATA);
+
+const pages = [
+  ["dashboard", "总览"],
+  ["answers", "原始答卷"],
+  ["insights", "洞察分析"],
+  ["reports", "每周报告"],
+];
+
+const defaultCampaigns = [
+  { id: "baixi-garden", label: "4.百戏游园", title: "INS LAND新乐园百戏游园市场需求调研问卷", pendingLink: false },
+  { id: "sunset-ride", label: "3.落日飞车", title: "INS LAND新乐园落日飞车市场需求调研问卷", pendingLink: false },
+  { id: "flash-cruise", label: "2.闪光邮轮", title: "INS LAND新乐园闪光邮轮市场需求调研问卷", pendingLink: false },
+  { id: "game-world", label: "1.游戏世界", title: "INS LAND新乐园游戏世界市场需求调研问卷", pendingLink: false },
+];
+
+async function api(path, options) {
+  if (STATIC_MODE) {
+    throw new Error("公开版为静态只读页面，不能执行同步或生成操作。");
+  }
+  const res = await fetch(path, options);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+async function loadAll() {
+  if (STATIC_MODE) {
+    applyStaticPayload(window.STATIC_DATA);
+    render();
+    return;
+  }
+  try {
+    const data = await api("/api/static-data");
+    applyStaticPayload(data);
+    render();
+    return;
+  } catch (error) {
+    console.warn("Falling back to legacy local APIs", error);
+  }
+  const [dashboard, responses, insights, reports] = await Promise.all([
+    api("/api/dashboard"),
+    api("/api/responses"),
+    api("/api/insights"),
+    api("/api/reports"),
+  ]);
+  state.campaigns = defaultCampaigns;
+  state.campaignData = {
+    "game-world": {
+      dashboard,
+      responses,
+      insights,
+      reports,
+      pendingLink: false,
+    },
+    "flash-cruise": createEmptyCampaignPayload(),
+  };
+  applyCampaignData();
+  render();
+}
+
+function applyStaticPayload(data) {
+  state.campaigns = data.campaigns || defaultCampaigns;
+  state.portfolioBySource = data.portfolioBySource || { all: data.portfolio || null };
+  state.campaign = data.activeCampaign || (state.campaigns.some((item) => item.id === state.campaign) ? state.campaign : (state.campaigns[0]?.id || "baixi-garden"));
+  state.campaignData = data.campaignData || {
+    "game-world": {
+      dashboard: data.dashboard,
+      responses: data.responses,
+      insights: data.insights,
+      reports: data.reports,
+      pendingLink: false,
+    },
+  };
+  applyCampaignData();
+}
+
+function createEmptyCampaignPayload() {
+  const metrics = {
+    totalResponses: 0,
+    participationRate: 0,
+    averageRating: null,
+    ratingDistribution: {},
+    positiveKeywords: [],
+    negativeKeywords: [],
+    selectedResponses: [],
+  };
+  return {
+    pendingLink: true,
+    dashboard: { metrics, latestSync: null, hasOpenAIKey: false },
+    responses: { responses: [] },
+    insights: {
+      metrics,
+      analysis: {
+        summary: "该周期正在等待新的问卷星链接，接入后会独立同步答卷、可视化和周报。",
+        recommendations: [],
+        positive_keywords: [],
+        negative_keywords: [],
+        selected_responses: [],
+      },
+    },
+    reports: { reports: [], refreshReports: [], onepagePdfs: [] },
+  };
+}
+
+function activeCampaign() {
+  return state.campaigns.find((item) => item.id === state.campaign) || state.campaigns[0] || defaultCampaigns[0];
+}
+
+function activePayload() {
+  return state.campaignData[state.campaign] || createEmptyCampaignPayload();
+}
+
+function applyCampaignData() {
+  const data = activePayload();
+  applySourceView(data);
+  state.reports = data.reports?.reports || [];
+  state.refreshReports = data.reports?.refreshReports || [];
+  state.onepagePdfs = data.reports?.onepagePdfs || [];
+  state.expanded = null;
+}
+
+function applySourceView(data = activePayload()) {
+  const view = data.sourceViews?.[state.source];
+  state.portfolio = state.portfolioBySource?.[state.source] || state.portfolioBySource?.all || null;
+  if (view) {
+    state.dashboard = { ...(data.dashboard || {}), metrics: view.metrics };
+    state.responses = sortResponsesNewestFirst(view.responses || []);
+    state.insights = { metrics: view.metrics, analysis: view.analysis || {} };
+    state.sourceCounts = view.sourceCounts || { online: 0, offline: 0 };
+    return;
+  }
+  state.dashboard = data.dashboard || createEmptyCampaignPayload().dashboard;
+  state.responses = sortResponsesNewestFirst(data.responses?.responses || []);
+  state.insights = data.insights || createEmptyCampaignPayload().insights;
+  state.sourceCounts = { online: state.responses.length, offline: 0 };
+}
+
+function nav() {
+  const groups = orderedCampaigns().map((campaign) => {
+    const isActiveCampaign = state.campaign === campaign.id;
+    const children = pages.map(([id, label]) => `<div class="nav-child ${isActiveCampaign && state.page === id ? "active" : ""}" data-campaign="${campaign.id}" data-page="${id}">${label}</div>`).join("");
+    return `<div class="nav-group">
+      <button class="nav-campaign ${isActiveCampaign && state.page !== "portfolio" ? "active" : ""}" data-campaign="${campaign.id}" data-page="${state.page === "portfolio" ? "dashboard" : state.page}">
+        <span>${escapeHtml(campaign.label)}</span>
+        <span class="nav-status">${campaign.pendingLink ? "待链接" : "已接入"}</span>
+      </button>
+      <div class="nav-children ${isActiveCampaign ? "open" : ""}">${children}</div>
+    </div>`;
+  }).join("");
+  return `<aside><div class="brand"><div class="mark"></div><span>INS LAND 调研</span></div><nav>
+    <button class="nav-overview ${state.page === "portfolio" ? "active" : ""}" data-page="portfolio">综合评价</button>
+    <div class="nav-divider"><span>活动周期</span></div>
+    ${groups}
+  </nav></aside>`;
+}
+
+function portfolioOrbitGraphic() {
+  return `<div class="portfolio-orbit" aria-hidden="true">
+    <span class="orbit-line orbit-a"></span>
+    <span class="orbit-line orbit-b"></span>
+    <span class="orbit-line orbit-c"></span>
+    <span class="orbit-line orbit-d"></span>
+    <span class="orbit-core"></span>
+    <i class="orbit-node node-blue"></i>
+    <i class="orbit-node node-green"></i>
+    <i class="orbit-node node-coral"></i>
+    <i class="orbit-node node-yellow"></i>
+  </div>`;
+}
+
+function shell(content) {
+  const isPortfolio = state.page === "portfolio";
+  const latest = state.dashboard?.latestSync;
+  const updated = latest?.finished_at ? `最后同步：${latest.finished_at}` : "尚未同步";
+  const modeText = STATIC_MODE ? "公开静态版" : "本地数据";
+  const campaign = activeCampaign();
+  const isPending = Boolean(campaign.pendingLink || activePayload().pendingLink);
+  const actionDisabled = isPending || (!STATIC_MODE && state.campaign !== "game-world");
+  const mobileNav = `<div class="mobile-nav">${
+    `<button class="mobile-campaign-item ${isPortfolio ? "active" : ""}" data-page="portfolio">综合评价</button>` +
+    orderedCampaigns().map((item) => `<button class="mobile-campaign-item ${!isPortfolio && state.campaign === item.id ? "active" : ""}" data-campaign="${item.id}" data-page="dashboard">${escapeHtml(item.label)}</button>`).join("")
+  }</div>${isPortfolio ? "" : `<div class="mobile-nav page-tabs">${
+    pages.map(([id, label]) => `<button class="mobile-nav-item ${state.page === id ? "active" : ""}" data-campaign="${state.campaign}" data-page="${id}">${label}</button>`).join("")
+  }</div>`}`;
+  return `<div class="app">${nav()}<main>
+    <div class="topbar ${isPortfolio ? "portfolio-topbar" : ""}">
+      <div><div class="campaign-eyebrow">${isPortfolio ? "全部 Campaign" : escapeHtml(campaign.label)}</div><h1>${isPortfolio ? "综合评价" : escapeHtml(campaign.title || campaign.label)}</h1><div class="sub">${isPortfolio ? `${state.portfolio?.completedCampaigns || 0} 个已完成活动 · ${modeText}` : `${updated} · ${modeText} · ${state.dashboard?.hasOpenAIKey ? "OpenAI 已配置" : "OpenAI 未配置"}`}</div></div>
+      ${isPortfolio ? portfolioOrbitGraphic() : ""}
+      <div class="topbar-tools">
+      <div class="source-filter" role="group" aria-label="调研来源">
+        <button data-source="all" class="${state.source === "all" ? "active" : ""}">全部</button>
+        <button data-source="online" class="${state.source === "online" ? "active" : ""}">线上</button>
+        <button data-source="offline" class="${state.source === "offline" ? "active" : ""}">线下</button>
+      </div>
+      <div class="actions ${STATIC_MODE || isPortfolio ? "static-actions" : ""}">
+        <button id="analysisBtn" ${actionDisabled ? "disabled" : ""}>生成分析</button>
+        <button id="reportBtn" ${actionDisabled ? "disabled" : ""}>生成周报</button>
+        <button id="pdfBtn" ${actionDisabled ? "disabled" : ""}>生成图文PDF</button>
+        <button class="primary" id="syncBtn" ${actionDisabled ? "disabled" : ""}>立即同步</button>
+      </div>
+      </div>
+    </div>
+    ${mobileNav}
+    ${!isPortfolio && isPending ? pendingBanner() : ""}
+    ${content}
+  </main></div>`;
+}
+
+function orderedCampaigns() {
+  return state.campaigns.length ? state.campaigns : defaultCampaigns;
+}
+
+function pendingBanner() {
+  return `<section class="pending-banner">
+    <div><strong>等待新问卷数据</strong><span>当前周期已预留完整结构；问卷开始提交后，会独立抓取、分析、生成周报和 PDF。</span></div>
+  </section>`;
+}
+
+function metricsCards(metrics) {
+  const ratingCount = Object.values(metrics.ratingDistribution || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  const participation = state.source === "online" && metrics.participationAnswered
+    ? `<div class="label">活动参与率</div><div class="value metric-accent-coral">${metrics.participationRate ?? 0}%</div><div class="metric-caption">${metrics.participationAnswered} 份有效回答</div>`
+    : `<div class="label">样本来源</div><div class="source-stat-grid"><div><strong>${state.sourceCounts.online || 0}</strong><span>线上</span></div><div><strong>${state.sourceCounts.offline || 0}</strong><span>线下</span></div></div><div class="metric-caption">按采集渠道区分</div>`;
+  return `<section class="metrics campaign-metrics">
+    <div class="card pink metric-card source-metric">${participation}</div>
+    <div class="card blue metric-card"><div class="label">样本总量</div><div class="value metric-accent-blue">${metrics.totalResponses ?? 0}</div><div class="metric-caption">当前已同步答卷</div></div>
+    <div class="card green score-card metric-card"><div class="label">平均评分</div><div class="score-circle"><div class="score-value">${metrics.averageRating ?? "-"}</div><div class="score-unit">/ 10</div></div><div class="metric-caption">${ratingCount} 个有效评分</div></div>
+  </section>`;
+}
+
+function ratingChart(dist = {}) {
+  const max = Math.max(1, ...Object.values(dist).map(Number));
+  const bars = Array.from({ length: 10 }, (_, index) => {
+    const score = String(index + 1);
+    const value = Number(dist[score] || 0);
+    const height = Math.max(6, Math.round(value / max * 160));
+    return `<div title="${score}分：${value}" class="bar-column"><span class="bar-count">${value || ""}</span><i class="bar" style="height:${height}px"></i><span class="bar-score">${score}</span></div>`;
+  }).join("");
+  return `<div class="chart">${bars}</div>`;
+}
+
+function keywordPanel(title, items = [], mode = "positive") {
+  const max = Math.max(1, ...items.map((item) => Number(item.count ?? item.countEstimate ?? 0)));
+  const offsets = [
+    ["-4px", "2px", "-2deg", "0 2px 0 0"],
+    ["7px", "-3px", "1.5deg", "6px 0 0 0"],
+    ["-2px", "-8px", "0deg", "0 0 5px 0"],
+    ["10px", "5px", "2.5deg", "5px 4px 0 0"],
+    ["-8px", "8px", "-1deg", "0 7px 0 2px"],
+    ["4px", "-2px", "3deg", "2px 0 0 0"],
+    ["-5px", "0", "-3deg", "0 3px 0 0"],
+    ["8px", "7px", "1deg", "6px 0 3px 0"],
+    ["0", "-5px", "-1.5deg", "0 0 0 0"],
+    ["-10px", "4px", "2deg", "4px 0 0 0"],
+  ];
+  const rows = items.slice(0, 14).map((item, index) => {
+    const count = Number(item.count ?? item.countEstimate ?? 0);
+    const ratio = count / max;
+    const size = ratio > 0.75 ? 4 : ratio > 0.45 ? 3 : ratio > 0.22 ? 2 : 1;
+    const [x, y, r, m] = offsets[index % offsets.length];
+    return `<div class="keyword-row ${mode === "positive" ? "positive-tag" : "negative-tag"} size-${size}" style="--x:${x};--y:${y};--r:${r};--m:${m};">
+    <div class="keyword"><span class="dot"></span><span class="keyword-name">${escapeHtml(item.keyword)}</span></div>
+    <span class="count">${count}</span>
+  </div>`;
+  }).join("") || `<div class="empty">暂无关键词</div>`;
+  return `<div class="card ${mode === "positive" ? "green" : "pink"} ${mode === "negative" ? "negative" : ""}">
+    <div class="section-title"><span>${title}</span><span class="tiny">${mode === "positive" ? "左侧" : "右侧"}</span></div>
+    <div class="keyword-list">${rows}</div>
+    <div class="keyword-cloud-note">字号代表出现频次，位置做轻微错落排列。</div>
+  </div>`;
+}
+
+function selectedResponses(items = []) {
+  const cards = items.slice(0, 6).map((item) => `<div class="response-card">
+    <div class="response-meta"><span>${escapeHtml(item.field || item.reason || "精选答复")}</span><span>${escapeHtml(item.submitted_at || item.submittedAt || "")}</span></div>
+    <div class="response-meta secondary"><span>${item.rating ? `${item.rating}分` : ""}</span><span>${item.sequence ? `序号 ${item.sequence}` : ""}</span></div>
+    <div class="response-text">“${escapeHtml(item.quote || "")}”</div>
+    <div class="tags">${(item.tags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
+  </div>`).join("") || `<div class="empty">暂无精选答复，完成同步后自动生成。</div>`;
+  return `<section class="card"><div class="section-title"><span>精选调研答复</span><span class="tiny">填空题中信息量高、有具体意见的回答</span></div><div class="selected-grid">${cards}</div></section>`;
+}
+
+function guidancePanel(metrics = {}) {
+  const guidance = metrics.guidance || {};
+  const distribution = guidance.distribution || {};
+  const entries = Object.entries(distribution);
+  const total = Number(guidance.totalAnswered || 0);
+  if (!entries.length) return "";
+  const max = Math.max(1, ...entries.map(([, value]) => Number(value || 0)));
+  const bars = entries.map(([label, value]) => {
+    const count = Number(value || 0);
+    const width = Math.max(8, Math.round(count / max * 100));
+    const percent = total ? Math.round(count / total * 100) : 0;
+    return `<div class="guidance-row">
+      <div class="guidance-label">${escapeHtml(label)}</div>
+      <div class="guidance-bar"><span style="width:${width}%"></span></div>
+      <div class="guidance-count">${count} · ${percent}%</div>
+    </div>`;
+  }).join("");
+  const reasons = (guidance.unclearReasons || []).slice(0, 4).map((item) => `<div class="guidance-reason">
+    <div class="response-meta"><span>序号 ${escapeHtml(item.sequence || "")}</span><span>${escapeHtml(item.submitted_at || "")}</span></div>
+    <div>${escapeHtml(item.reason || "")}</div>
+  </div>`).join("") || `<div class="empty compact-empty">暂无“不清晰”追问内容。</div>`;
+  return `<section class="card guidance-card">
+    <div class="section-title"><span>导览清晰度</span><span class="tiny">${total} 份有效回答</span></div>
+    <div class="guidance-summary">
+      <div><div class="label">清晰率</div><div class="value">${guidance.clearRate ?? "-"}%</div></div>
+      <div><div class="label">不清晰反馈</div><div class="value">${guidance.unclearCount ?? 0}</div></div>
+    </div>
+    <div class="guidance-list">${bars}</div>
+    <div class="section-title small-title"><span>不清晰追问</span><span class="tiny">最多显示 4 条</span></div>
+    <div class="guidance-reasons">${reasons}</div>
+  </section>`;
+}
+
+function djContestPanel(metrics = {}) {
+  const contest = metrics.djContest || {};
+  const title = contest.title || "本期活动反馈";
+  const distribution = contest.awarenessDistribution || {};
+  const themes = contest.topThemes || [];
+  const selected = contest.selectedResponses || [];
+  if (!contest.totalAnswered) return "";
+  const period = [contest.earliestSubmittedAt, contest.latestSubmittedAt].filter(Boolean).join(" - ");
+  const max = Math.max(1, ...Object.values(distribution).map(Number));
+  const awareness = Object.entries(distribution).map(([label, value]) => {
+    const count = Number(value || 0);
+    const width = Math.max(8, Math.round(count / max * 100));
+    return `<div class="guidance-row">
+      <div class="guidance-label">${escapeHtml(label)}</div>
+      <div class="guidance-bar dj-bar"><span style="width:${width}%"></span></div>
+      <div class="guidance-count">${count}</div>
+    </div>`;
+  }).join("");
+  const themeTags = themes.slice(0, 8).map((item) => `<span class="dj-theme">${escapeHtml(item.keyword)} ${Number(item.count || 0)}</span>`).join("") || `<span class="tiny">暂无明显主题</span>`;
+  const quotes = selected.slice(0, 4).map((item) => `<div class="guidance-reason">
+    <div class="response-meta"><span>序号 ${escapeHtml(item.sequence || "")}</span><span>${escapeHtml(item.submitted_at || "")}</span></div>
+    <div>${escapeHtml(item.text || "")}</div>
+  </div>`).join("");
+  return `<section class="card dj-card">
+    <div class="section-title"><span>${escapeHtml(title)}反馈</span><span class="tiny">${escapeHtml(period || "暂无日期")}</span></div>
+    <div class="dj-overview">
+      <div><div class="label">有效回答</div><div class="value">${contest.totalAnswered}</div></div>
+      <div><div class="label">最新反馈</div><div class="dj-date">${escapeHtml(contest.latestSubmittedAt || "-")}</div></div>
+    </div>
+    <div class="guidance-list">${awareness}</div>
+    <div class="dj-themes">${themeTags}</div>
+    <div class="section-title small-title"><span>代表性原文</span><span class="tiny">最多显示 4 条</span></div>
+    <div class="guidance-reasons">${quotes}</div>
+  </section>`;
+}
+
+function portfolioMetrics(summary = {}) {
+  const online = Number(summary.sourceCounts?.online || 0);
+  const offline = Number(summary.sourceCounts?.offline || 0);
+  const total = Math.max(1, online + offline);
+  return `<section class="portfolio-metrics">
+    <div class="card blue portfolio-stat sample-stat"><div class="label">累计样本</div><div class="value">${summary.totalResponses || 0}</div><div class="source-composition"><i class="online" style="width:${online / total * 100}%"></i><i class="offline" style="width:${offline / total * 100}%"></i></div><div class="source-composition-label"><span>线上 ${online}</span><span>线下 ${offline}</span></div></div>
+    <div class="card green portfolio-score"><div class="label">综合平均分</div><div class="score-circle"><div class="score-value">${summary.weightedAverageRating ?? "-"}</div><div class="score-unit">/ 10</div></div><div class="muted">按全部有效评分加权</div></div>
+    <div class="card pink portfolio-stat"><div class="label">有效评分</div><div class="value">${summary.validRatingCount || 0}</div><div class="muted">已填写评分的样本</div></div>
+    <div class="card portfolio-stat"><div class="label">已完成活动</div><div class="value">${summary.completedCampaigns || 0}</div><div class="muted">纳入综合评价的周期</div></div>
+  </section>`;
+}
+
+function campaignScoreComparison(items = [], summary = {}) {
+  const maxSamples = Math.max(1, ...items.map((item) => Number(item.totalResponses || 0)));
+  const validRatings = items.map((item) => Number(item.averageRating)).filter((value) => Number.isFinite(value) && value > 0);
+  const plotMin = validRatings.length ? Math.min(8, Math.floor(Math.min(...validRatings))) : 0;
+  const plotRange = Math.max(1, 10 - plotMin);
+  const axisValues = Array.from({ length: 5 }, (_, index) => plotMin + plotRange * index / 4);
+  const rows = items.map((item, index) => {
+    const rating = Number(item.averageRating || 0);
+    const position = Math.max(0, Math.min(100, (rating - plotMin) / plotRange * 100));
+    const size = 34 + Math.sqrt(Number(item.totalResponses || 0) / maxSamples) * 38;
+    const secondaryMetric = state.source === "online" && item.participationRate != null
+      ? `参与率 ${item.participationRate}%`
+      : `${item.totalResponses || 0} 份样本`;
+    return `<article class="campaign-plot-row plot-tone-${index + 1}">
+      <div class="campaign-plot-label"><strong>${escapeHtml(item.label)}</strong><span>${secondaryMetric} · ${item.ratingCount || 0} 个评分</span></div>
+      <div class="campaign-plot-track"><i class="plot-tick tick-8"></i><i class="plot-tick tick-9"></i><i class="plot-tick tick-10"></i><span class="campaign-plot-dot" style="left:${position}%;width:${size}px;height:${size}px"><b>${item.averageRating ?? "-"}</b></span></div>
+    </article>`;
+  }).join("") || `<div class="empty">暂无活动评分。</div>`;
+  return `<section class="card campaign-score-card visual-score-card"><div class="section-title"><span>活动评分与样本规模</span><span class="tiny">横轴 ${plotMin}–10 分 · 圆点大小为样本量</span></div>
+    <div class="campaign-score-overview"><div class="portfolio-score-core"><span>综合评分</span><strong>${summary.weightedAverageRating ?? "-"}</strong><small>/ 10 · ${summary.validRatingCount || 0} 个有效评分</small></div><div class="campaign-score-plot"><div class="plot-axis">${axisValues.map((value) => `<span>${Number.isInteger(value) ? value : value.toFixed(1)}</span>`).join("")}</div>${rows}</div></div>
+  </section>`;
+}
+
+function coreIssues(categories = []) {
+  const cards = categories.map((category, index) => {
+    const isOpen = state.activeIssue === category.id;
+    const samples = (category.issues || []).flatMap((issue) => (issue.samples || []).map((sample) => ({ ...sample, issueKeyword: issue.keyword })));
+    const issues = (category.issues || []).map((issue, issueIndex) => `<div class="bubble-issue-tag tag-${issueIndex % 4}">
+      <span>${escapeHtml(issue.keyword)}</span><strong>${Number(issue.weight || 0)}</strong>
+    </div>`).join("") || `<div class="dimension-clear">当前无集中负向信号</div>`;
+    const sampleList = isOpen ? `<div class="issue-sample-panel dimension-samples">
+      <div class="issue-sample-head"><strong>${escapeHtml(category.title)} · 样本内容</strong><span>${samples.length} 条问题记录</span></div>
+      <div class="issue-sample-list">${samples.map((sample, sampleIndex) => `<button class="issue-sample" data-category-id="${escapeAttr(category.id)}" data-category-sample-index="${sampleIndex}">
+        <span class="issue-sample-meta"><b>${escapeHtml(sample.campaignLabel || "")}</b><time>${escapeHtml(sample.submittedAt || "")}</time></span>
+        <span class="sample-issue-tag">${escapeHtml(sample.issueKeyword || "")}</span>
+        <span class="issue-sample-text"><small>${escapeHtml(sample.question || "原始问题")}</small>${escapeHtml(sample.text || "")}</span>
+        <span class="issue-sample-link">查看原答卷 →</span>
+      </button>`).join("") || `<div class="empty">当前维度暂无可追溯样本。</div>`}</div>
+    </div>` : "";
+    return `<article class="issue-bubble-cluster bubble-${escapeAttr(category.id)}">
+      <div class="bubble-cluster-index">0${index + 1}</div>
+      <div class="bubble-cluster-head">
+        <div><div class="issue-kicker">EXPERIENCE DIMENSION</div><h3>${escapeHtml(category.title)}</h3><p>${escapeHtml(category.scope)}</p></div>
+        <button class="bubble-count-orb" data-issue="${escapeAttr(category.id)}" aria-expanded="${isOpen}"><strong>${Number(category.count || 0)}</strong><span>问题提及</span><small>${isOpen ? "收起" : "查看样本"}</small></button>
+      </div>
+      <div class="bubble-issue-cloud">${issues}</div>
+      <div class="bubble-dialogues">
+        <div class="diagnosis-bubble"><strong>问题判断</strong><p>${escapeHtml(category.summary)}</p></div>
+        <div class="action-bubble"><strong>优化方向</strong><p>${escapeHtml(category.action)}</p></div>
+      </div>
+      <div class="issue-sources">${(category.sources || []).map((source) => `<span>${escapeHtml(source)}</span>`).join("")}</div>
+      ${sampleList}
+    </article>`;
+  }).join("") || `<div class="empty">暂无足够问题信号，后续活动数据更新后自动补充。</div>`;
+  return `<section class="card portfolio-issues bubble-wall-section"><div class="section-title"><span>核心问题智能总结</span><span class="tiny">三大体验维度 · 问题—证据—行动</span></div><div class="issue-bubble-wall ordered-bubble-stack">${cards}</div></section>`;
+}
+
+function keywordRanking(items = [], mode = "positive") {
+  const max = Math.max(1, ...items.map((item) => Number(item.count || 0)));
+  return `<div class="keyword-ranking">${items.slice(0, 8).map((item, index) => `<div class="rank-row">
+    <span class="rank-number">${index + 1}</span><span class="rank-name">${escapeHtml(item.keyword)}</span>
+    <span class="rank-track ${mode}"><i style="width:${Math.max(5, Number(item.count || 0) / max * 100)}%"></i></span><strong>${Number(item.count || 0)}</strong>
+  </div>`).join("") || `<div class="empty">暂无关键词</div>`}</div>`;
+}
+
+function portfolioKeywords(summary = {}) {
+  return `<section class="portfolio-keywords">
+    <div class="card green"><div class="section-title"><span>正向关键词频率</span><span class="tiny">跨活动累计</span></div>${keywordRanking(summary.positiveKeywords, "positive")}<div class="portfolio-cloud">${(summary.positiveKeywords || []).slice(0, 12).map((item, index) => `<span class="cloud-word positive word-${index % 4}">${escapeHtml(item.keyword)}<small>${item.count}</small></span>`).join("")}</div></div>
+    <div class="card pink"><div class="section-title"><span>负向关键词频率</span><span class="tiny">跨活动累计</span></div>${keywordRanking(summary.negativeKeywords, "negative")}<div class="portfolio-cloud">${(summary.negativeKeywords || []).slice(0, 12).map((item, index) => `<span class="cloud-word negative word-${index % 4}">${escapeHtml(item.keyword)}<small>${item.count}</small></span>`).join("")}</div></div>
+  </section>`;
+}
+
+function portfolioPage() {
+  const summary = state.portfolio || {};
+  return shell(`${portfolioMetrics(summary)}
+    ${campaignScoreComparison(summary.campaignScores, summary)}
+    ${coreIssues(summary.issueCategories)}
+    ${portfolioKeywords(summary)}`);
+}
+
+function dashboardPage() {
+  const metrics = state.dashboard?.metrics || {};
+  const analysis = state.insights?.analysis || {};
+  return shell(`${metricsCards(metrics)}
+    <section class="grid">
+      <div class="card"><div class="section-title"><span>评分分布</span><span class="tiny">1-10 分</span></div>${ratingChart(metrics.ratingDistribution)}</div>
+      <div class="card dashboard-summary-card"><div class="section-title"><span>AI 今日摘要</span><span class="tiny">OpenAI / 本地规则</span></div><div class="quote dashboard-summary-text">${escapeHtml(analysis.summary || "同步数据后会显示分析摘要。")}</div></div>
+    </section>
+    ${guidancePanel(metrics)}
+    ${djContestPanel(metrics)}
+    <section class="keyword-grid">${keywordPanel("正向关键词", metrics.positiveKeywords, "positive")}${keywordPanel("负向关键词", metrics.negativeKeywords, "negative")}</section>
+    ${selectedResponses(metrics.selectedResponses)}
+    ${rawPreview()}`);
+}
+
+function rawPreview() {
+  const rows = state.responses.slice(0, 6);
+  return `<section class="card"><div class="section-title"><span>原始答卷预览</span><span class="tiny">完整内容见“原始答卷”</span></div>${answerTable(rows)}</section>`;
+}
+
+function answersPage() {
+  const query = state.search.trim().toLowerCase();
+  const rows = state.responses.filter((item) => {
+    if (state.answerFocus) {
+      if (state.answerFocus.recordKey) return String(item.record_key || "") === String(state.answerFocus.recordKey);
+      return String(item.sequence) === String(state.answerFocus.sequence)
+        && String(item.submitted_at || "") === String(state.answerFocus.submittedAt || "");
+    }
+    return !query || JSON.stringify(item).toLowerCase().includes(query);
+  });
+  return shell(`<section class="card">
+    <div class="section-title"><span>原始答卷</span><span class="tiny">${rows.length} / ${state.responses.length} 条</span></div>
+    ${state.answerFocus ? `<div class="answer-focus"><span>已从综合评价定位到答卷 #${escapeHtml(state.answerFocus.sequence)}</span><button id="clearAnswerFocus">查看全部答卷</button></div>` : ""}
+    <div class="toolbar"><input id="searchInput" placeholder="搜索开放题、导览、年龄、性别、评分" value="${escapeAttr(state.search)}"></div>
+    ${answerTable(rows)}
+  </section>`);
+}
+
+function answerTable(rows) {
+  if (!rows.length) return `<div class="empty">当前周期暂无提交数据。问卷开始填写后，自动刷新会把新答卷同步到这里。</div>`;
+  return `<div class="table-wrap"><table><thead><tr>
+    <th>序号</th><th>来源 / 时间</th><th>用户信息</th><th>评分</th><th>关键回答摘要</th><th>完整答卷</th>
+  </tr></thead><tbody>${rows.map((item) => {
+    const a = item.answers || {};
+    const key = item.record_key || `${item.sequence}-${item.submitted_at}`;
+    const isOffline = item.channel === "offline";
+    const displayDate = isOffline ? [item.period_label, item.date_label].filter(Boolean).join(" · ") : (item.submitted_at || "");
+    const detail = state.expanded === key ? answerDetail(item) : "";
+    const suggestions = [...new Set([a["建议"], a["改进"], a["想玩主题"]].filter(Boolean))].join(" / ");
+    const highlights = [a["印象最深"], a["本期活动反馈"], a["夏日DJ大赛"], suggestions].filter(Boolean).slice(0, 2).join(" / ");
+    return `<tr class="answer-row ${state.expanded === key ? "is-expanded" : ""}" data-expand="${escapeAttr(key)}"><td class="compact-cell">${item.sequence}</td><td class="compact-cell"><span class="source-badge ${isOffline ? "offline" : "online"}">${isOffline ? "线下" : "线上"}</span><span class="source-date">${escapeHtml(displayDate)}</span></td><td class="compact-cell"><strong>${escapeHtml(item.gender || "未填")}</strong><span class="source-date">${escapeHtml(item.age || "年龄未填")}${item.participated ? ` · ${escapeHtml(item.participated)}` : ""}</span></td><td class="rating-cell">${item.rating ?? "-"}<small>/10</small></td><td class="text-cell answer-summary">${escapeHtml(highlights || "点击查看完整问题与回答")}</td><td class="expand-cell">${state.expanded === key ? "收起" : "查看全部问题 →"}</td></tr>${detail}`;
+  }).join("")}</tbody></table></div>`;
+}
+
+function answerDetail(item) {
+  const a = item.answers || {};
+  const metadataFields = ["序号", "提交答卷时间", "所用时间", "来源", "来源详情", "来自IP", "总分"];
+  const rawEntries = Object.entries(item.raw_answers || item.raw || {}).filter(([question, value]) => {
+    const label = String(question || "").trim();
+    return label && String(value ?? "").trim() && !metadataFields.some((field) => label === field || label.startsWith(`${field}:`));
+  });
+  const fallbackFields = ["印象最深", "导览清晰", "导览不清晰", "本期活动名称", "本期活动反馈", "建议", "想玩主题", "INS印象", "改进"]
+    .filter((field) => String(a[field] ?? "").trim())
+    .map((field) => [field, a[field], true]);
+  const entries = rawEntries.length ? rawEntries.map(([question, value]) => [question, value, false]) : fallbackFields;
+  return `<tr class="detail-row"><td colspan="6"><div class="answer-detail">
+    <div class="detail-meta">
+      <span class="detail-pill">${item.channel === "offline" ? "调研周期" : "提交日期"}：${escapeHtml(item.channel === "offline" ? [item.period_label, item.date_label].filter(Boolean).join(" · ") : (item.submitted_at || ""))}</span>
+      <span class="detail-pill">所用时间：${escapeHtml(item.duration || "")}</span>
+      <span class="detail-pill">来源：${escapeHtml(item.source || "")}</span>
+      <span class="detail-pill">来源详情：${escapeHtml(item.source_detail || "")}</span>
+      <span class="detail-pill">地区：${escapeHtml(item.location || "")}</span>
+    </div>
+    <div class="answer-question-head"><strong>完整问题与回答</strong><span>${entries.length} 个已回答问题${rawEntries.length ? " · 保留原始题目" : " · 标准化字段"}</span></div>
+    <div class="detail-grid question-detail-grid">${entries.map(([question, rawValue, normalized]) => {
+      const value = question === "导览清晰" ? formatGuidanceClarity(rawValue) : rawValue;
+      return `<div class="detail-item question-answer-item"><div class="detail-label">${normalized ? '<span class="normalized-badge">标准化</span>' : ""}${escapeHtml(question)}</div><div class="detail-value">${escapeHtml(value || "未填写")}</div></div>`;
+    }).join("")}</div>
+  </div></td></tr>`;
+}
+
+function insightsPage() {
+  const metrics = state.insights?.metrics || state.dashboard?.metrics || {};
+  const analysis = state.insights?.analysis || {};
+  return shell(`<section class="grid">
+    <div class="card"><div class="section-title"><span>整体洞察</span><span class="tiny">分析摘要</span></div><div class="quote">${escapeHtml(analysis.summary || "暂无分析。")}</div></div>
+    <div class="card"><div class="section-title"><span>建议优先级</span><span class="tiny">行动清单</span></div>${recommendations(analysis.recommendations)}</div>
+  </section>
+  <section class="keyword-grid">${keywordPanel("正向关键词", analysis.positive_keywords || metrics.positiveKeywords, "positive")}${keywordPanel("负向关键词", analysis.negative_keywords || metrics.negativeKeywords, "negative")}</section>
+  ${selectedResponses(analysis.selected_responses || metrics.selectedResponses)}`);
+}
+
+function recommendations(items = []) {
+  if (!items.length) return `<div class="empty">暂无建议。</div>`;
+  return `<div class="keyword-list">${items.map((item) => `<div class="quote"><strong>${escapeHtml(item.priority || "medium")}</strong> ${escapeHtml(item.action || "")}<br><span class="tiny">${escapeHtml(item.evidence || "")}</span></div>`).join("")}</div>`;
+}
+
+function reportsPage() {
+  const reports = state.reports || [];
+  const refreshReports = state.refreshReports || [];
+  const pdfs = state.onepagePdfs || [];
+  const current = reports[0];
+  const refreshList = refreshReports.length ? `<section class="card"><div class="section-title"><span>刷新前归档</span><span class="tiny">${refreshReports.length} 份留档</span></div>${refreshReports.map((item) => `<div class="quote"><strong>${escapeHtml(item.title)}</strong><br><span class="tiny">答卷数：${item.response_count} · ${escapeHtml(item.created_at || "")}</span><div class="report">${escapeHtml(item.report_markdown || "")}</div></div>`).join("")}</section>` : `<section class="card"><div class="section-title"><span>刷新前归档</span><span class="tiny">0 份留档</span></div><div class="empty">自动刷新前会先生成归档报告。</div></section>`;
+  const pdfList = `<section class="card"><div class="section-title"><span>图文 onepage PDF</span><span class="tiny">16:9 · 最多 2 页</span></div>${pdfs.length ? pdfs.map((item) => `<div class="quote"><strong>${escapeHtml(item.filename)}</strong><br><a href="${escapeAttr(item.download_url)}" target="_blank">下载 PDF</a></div>`).join("") : `<div class="empty">点击顶部“生成图文PDF”，会生成一份 16:9 图文版周报。</div>`}</section>`;
+  return shell(`<section class="card"><div class="section-title"><span>每周报告</span><span class="tiny">${reports.length} 份历史报告</span></div>${current ? `<div class="report">${escapeHtml(current.report_markdown)}</div>` : `<div class="empty">暂无周报，点击“生成周报”。</div>`}</section>${pdfList}${refreshList}`);
+}
+
+function render({ preserveMainScroll = false } = {}) {
+  const previousMainScroll = preserveMainScroll
+    ? (document.querySelector("main")?.scrollTop || 0)
+    : 0;
+  const content = state.page === "portfolio" ? portfolioPage()
+    : state.page === "answers" ? answersPage()
+    : state.page === "insights" ? insightsPage()
+    : state.page === "reports" ? reportsPage()
+    : dashboardPage();
+  document.getElementById("app").innerHTML = content;
+  bind();
+  if (preserveMainScroll) {
+    const main = document.querySelector("main");
+    if (main) main.scrollTop = previousMainScroll;
+  }
+}
+
+function bind() {
+  document.querySelectorAll("[data-source]").forEach((el) => el.addEventListener("click", () => {
+    state.source = el.dataset.source;
+    state.answerFocus = null;
+    applyCampaignData();
+    render();
+  }));
+  document.querySelectorAll("[data-page]").forEach((el) => el.addEventListener("click", () => {
+    if (el.dataset.campaign && state.campaign !== el.dataset.campaign) {
+      state.campaign = el.dataset.campaign;
+      applyCampaignData();
+    }
+    state.page = el.dataset.page;
+    render();
+  }));
+  document.getElementById("syncBtn")?.addEventListener("click", () => runAction("/api/sync", "同步"));
+  document.getElementById("analysisBtn")?.addEventListener("click", () => runAction("/api/analysis", "分析"));
+  document.getElementById("reportBtn")?.addEventListener("click", () => runAction("/api/reports/weekly", "周报"));
+  document.getElementById("pdfBtn")?.addEventListener("click", () => runPdfAction());
+  document.getElementById("searchInput")?.addEventListener("input", (event) => {
+    state.answerFocus = null;
+    state.search = event.target.value;
+    render();
+  });
+  document.getElementById("clearAnswerFocus")?.addEventListener("click", () => {
+    state.answerFocus = null;
+    state.expanded = null;
+    render();
+  });
+  document.querySelectorAll("[data-issue]").forEach((el) => el.addEventListener("click", () => {
+    state.activeIssue = state.activeIssue === el.dataset.issue ? null : el.dataset.issue;
+    render({ preserveMainScroll: true });
+  }));
+  document.querySelectorAll("[data-category-sample-index]").forEach((el) => el.addEventListener("click", () => {
+    const category = (state.portfolio?.issueCategories || []).find((item) => item.id === el.dataset.categoryId);
+    const samples = (category?.issues || []).flatMap((issue) => issue.samples || []);
+    const sample = samples[Number(el.dataset.categorySampleIndex)];
+    if (!sample) return;
+    state.campaign = sample.campaignId;
+    applyCampaignData();
+    state.page = "answers";
+    state.search = "";
+    state.answerFocus = { recordKey: sample.recordKey || "", sequence: sample.sequence, submittedAt: sample.submittedAt };
+    state.expanded = sample.recordKey || `${sample.sequence}-${sample.submittedAt}`;
+    render();
+  }));
+  document.querySelectorAll("[data-expand]").forEach((el) => el.addEventListener("click", () => {
+    const key = el.dataset.expand;
+    state.expanded = state.expanded === key ? null : key;
+    render({ preserveMainScroll: true });
+  }));
+}
+
+async function runPdfAction() {
+  try {
+    await api("/api/reports/onepage", { method: "POST" });
+    await loadAll();
+    state.page = "reports";
+    render();
+  } catch (error) {
+    alert(`图文PDF生成失败：${error.message}`);
+  }
+}
+
+async function runAction(path, label) {
+  state.loading = true;
+  render();
+  try {
+    await api(path, { method: "POST" });
+    await loadAll();
+  } catch (error) {
+    alert(`${label}失败：${error.message}`);
+  } finally {
+    state.loading = false;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/"/g, "&quot;");
+}
+
+function formatGuidanceClarity(value) {
+  const text = String(value || "").trim();
+  if (text === "是") return "清晰";
+  if (text === "否") return "不清晰";
+  return text;
+}
+
+function parseSubmittedAt(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const normalized = text
+    .replace(/[年月]/g, "/")
+    .replace(/日/g, "")
+    .replace(/-/g, "/")
+    .replace(/\s+/g, " ");
+  const match = normalized.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (!match) return 0;
+  const [, year, month, day, hour = "0", minute = "0", second = "0"] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)).getTime();
+}
+
+function sortResponsesNewestFirst(responses) {
+  return [...responses].sort((a, b) => {
+    const timeDiff = parseSubmittedAt(b.submitted_at) - parseSubmittedAt(a.submitted_at);
+    if (timeDiff) return timeDiff;
+    return Number(b.sequence || 0) - Number(a.sequence || 0);
+  });
+}
+
+loadAll().catch((error) => {
+  const fileHint = location.protocol === "file:" && !STATIC_MODE
+    ? `<p>你现在打开的是开发版 <code>web/index.html</code>，它需要本地服务接口。</p>
+       <p>直接查看请打开 <code>public_site/index.html</code>，或者访问 <code>http://127.0.0.1:8787/</code>。</p>`
+    : "";
+  document.getElementById("app").innerHTML = `<main><div class="card"><h1>加载失败</h1>${fileHint}<p>${escapeHtml(error.message)}</p></div></main>`;
+});
